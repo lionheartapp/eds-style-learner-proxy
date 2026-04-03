@@ -33,7 +33,7 @@ const SUPABASE_URL  = process.env.SUPABASE_URL || '';
 const SUPABASE_KEY  = process.env.SUPABASE_KEY || '';
 const CACHE_FILE    = path.join(__dirname, '.frame-cache.json');
 
-const GEMINI_MODEL = 'gemini-1.5-flash-latest';
+const GEMINI_MODEL = 'gemini-2.0-flash';
 const GEMINI_URL   = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
 app.use(cors({ origin: '*' }));
@@ -45,8 +45,15 @@ let frameCache = {};
 async function loadCache() {
   try {
     const raw = await fs.readFile(CACHE_FILE, 'utf-8');
-    frameCache = JSON.parse(raw);
-    console.log(`[cache] Loaded ${Object.keys(frameCache).length} cached frames`);
+    const loaded = JSON.parse(raw);
+    // Filter out any cached error responses from old model names
+    let cleaned = 0;
+    for (const [id, entry] of Object.entries(loaded)) {
+      const isError = entry.analysis?.raw && entry.analysis.raw.includes('is not found for API version');
+      if (!isError) frameCache[id] = entry;
+      else cleaned++;
+    }
+    console.log(`[cache] Loaded ${Object.keys(frameCache).length} cached frames (removed ${cleaned} stale errors)`);
   } catch { frameCache = {}; }
 }
 
