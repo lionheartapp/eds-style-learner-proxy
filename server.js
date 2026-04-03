@@ -525,6 +525,35 @@ app.post('/api/push-supabase', async (req, res) => {
   res.json(result);
 });
 
+app.post('/api/ask', async (req, res) => {
+  const { question, context } = req.body;
+  if (!GEMINI_KEY) return res.status(400).json({ error: 'No Gemini key configured' });
+
+  const prompt = `You are the Edmunds design system expert. You have deep knowledge of the Edmunds visual language based on analysis of hundreds of Figma frames.
+
+${context ? `## Design System Context\n${context}\n\n` : ''}
+
+Answer this question concisely and specifically. Reference actual colors, fonts, and patterns from the style guide when relevant. Give actionable design specs where possible.
+
+Question: ${question}`;
+
+  try {
+    const body = {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.3, maxOutputTokens: 1000 }
+    };
+    const r = await fetch(`${GEMINI_URL}?key=${GEMINI_KEY}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error?.message || 'Gemini error');
+    const answer = data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response';
+    res.json({ answer });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/supabase-data', async (req, res) => {
   if (!SUPABASE_URL || !SUPABASE_KEY) return res.status(400).json({ error: 'Supabase not configured' });
   try {
