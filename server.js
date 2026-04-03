@@ -33,7 +33,7 @@ const SUPABASE_URL  = process.env.SUPABASE_URL || '';
 const SUPABASE_KEY  = process.env.SUPABASE_KEY || '';
 const CACHE_FILE    = path.join(__dirname, '.frame-cache.json');
 
-const GEMINI_MODEL = 'gemini-1.5-flash';
+const GEMINI_MODEL = 'gemini-1.5-flash-latest';
 const GEMINI_URL   = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
 app.use(cors({ origin: '*' }));
