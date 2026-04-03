@@ -1,15 +1,17 @@
 /**
  * Figma Style Learner — Proxy Server
- * Fixes CORS for Anthropic API calls, handles rate limiting,
- * frame hash caching, and Supabase indexing.
+ * Uses Google Gemini for vision analysis (cheap/free tier)
+ * Uses Anthropic Claude for synthesis (optional, falls back to Gemini)
  *
- * Usage:
- *   npm install
- *   ANTHROPIC_API_KEY=sk-ant-xxx FIGMA_TOKEN=figd_xxx node server.js
+ * Required env vars:
+ *   GEMINI_API_KEY   — aistudio.google.com (free)
+ *   FIGMA_TOKEN      — figma.com settings
+ *   SUPABASE_URL     — your supabase project url
+ *   SUPABASE_KEY     — supabase service role key
  *
- * Optional (for Supabase auto-indexing):
- *   SUPABASE_URL=https://xxx.supabase.co
- *   SUPABASE_KEY=your-service-role-key
+ * Optional:
+ *   ANTHROPIC_API_KEY — for synthesis pass (falls back to Gemini if not set)
+ *   PORT              — defaults to 3579
  */
 
 import express from 'express';
@@ -22,20 +24,22 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-const PORT = 3579;
+const PORT = process.env.PORT || 3579;
 
-// ── Config ───────────────────────────────────────────────
+const GEMINI_KEY    = process.env.GEMINI_API_KEY || '';
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
 const FIGMA_TOKEN   = process.env.FIGMA_TOKEN || '';
 const SUPABASE_URL  = process.env.SUPABASE_URL || '';
 const SUPABASE_KEY  = process.env.SUPABASE_KEY || '';
 const CACHE_FILE    = path.join(__dirname, '.frame-cache.json');
 
+const GEMINI_MODEL = 'gemini-1.5-flash';
+const GEMINI_URL   = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.static(__dirname));
 
-// ── Frame hash cache (for delta detection) ───────────────
 let frameCache = {};
 
 async function loadCache() {
@@ -43,25 +47,22 @@ async function loadCache() {
     const raw = await fs.readFile(CACHE_FILE, 'utf-8');
     frameCache = JSON.parse(raw);
     console.log(`[cache] Loaded ${Object.keys(frameCache).length} cached frames`);
-  } catch {
-    frameCache = {};
-  }
+  } catch { frameCache = {}; }
 }
 
 async function saveCache() {
-  await fs.writeFile(CACHE_FILE, JSON.stringify(frameCache, null, 2));
+  try { await fs.writeFile(CACHE_FILE, JSON.stringify(frameCache, null, 2)); }
+  catch(e) { console.warn('[cache] Could not save:', e.message); }
 }
 
 function frameHash(frame) {
-  return crypto
-    .createHash('md5')
+  return crypto.createHash('md5')
     .update(`${frame.id}:${frame.lastModified || frame.name}:${frame.width}:${frame.height}`)
     .digest('hex');
 }
 
-// ── Rate limiter ──────────────────────────────────────────
 class RateLimiter {
-  constructor(reqPerSec = 2.5) {
+  constructor(reqPerSec = 2) {
     this.interval = 1000 / reqPerSec;
     this.lastCall = 0;
   }
@@ -73,233 +74,158 @@ class RateLimiter {
   }
 }
 
-const anthropicLimiter = new RateLimiter(2.5);
+const geminiLimiter = new RateLimiter(2);
 
-// ── Routes ────────────────────────────────────────────────
+async function analyzeWithGemini(imageB64, textPrompt, apiKey) {
+  await geminiLimiter.wait();
+  const body = {
+    contents: [{ parts: [
+      { inline_data: { mime_type: 'image/png', data: imageB64 } },
+      { text: textPrompt }
+    ]}],
+    generationConfig: { temperature: 0.2, maxOutputTokens: 1200 }
+  };
+  const r = await fetch(`${GEMINI_URL}?key=${apiKey}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error?.message || `Gemini error ${r.status}`);
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+}
 
-// Health check
+async function synthesizeWithGemini(prompt, apiKey) {
+  const body = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.3, maxOutputTokens: 8192 }
+  };
+  const r = await fetch(`${GEMINI_URL}?key=${apiKey}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error?.message || `Gemini error ${r.status}`);
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+}
+
 app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
+    hasGeminiKey: !!GEMINI_KEY,
     hasAnthropicKey: !!ANTHROPIC_KEY,
     hasFigmaToken: !!FIGMA_TOKEN,
     hasSupabase: !!(SUPABASE_URL && SUPABASE_KEY),
-    cachedFrames: Object.keys(frameCache).length
+    cachedFrames: Object.keys(frameCache).length,
+    visionProvider: GEMINI_KEY ? 'gemini' : 'none',
+    synthesisProvider: ANTHROPIC_KEY ? 'anthropic' : GEMINI_KEY ? 'gemini' : 'none'
   });
 });
 
-// Figma proxy
 app.get('/api/figma/*', async (req, res) => {
   const token = req.headers['x-figma-token'] || FIGMA_TOKEN;
   const figmaPath = '/' + req.params[0];
   const query = new URLSearchParams(req.query).toString();
   const url = `https://api.figma.com/v1${figmaPath}${query ? '?' + query : ''}`;
-
   try {
     const r = await fetch(url, { headers: { 'X-Figma-Token': token } });
     const data = await r.json();
     res.status(r.status).json(data);
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Claude Vision proxy — single frame
 app.post('/api/analyze-frame', async (req, res) => {
   const { frame, prompt, forceRefresh } = req.body;
-  const key = process.env.ANTHROPIC_API_KEY || req.headers['x-anthropic-key'] || ANTHROPIC_KEY;
+  const geminiKey = req.headers['x-gemini-key'] || GEMINI_KEY;
+  if (!geminiKey) return res.status(400).json({ error: 'No Gemini API key. Add GEMINI_API_KEY to Railway variables.' });
+  if (!frame.imageB64) return res.status(400).json({ error: 'No image data' });
 
-  if (!key) return res.status(400).json({ error: 'No Anthropic API key configured' });
-
-  // Check cache
   const hash = frameHash(frame);
   if (!forceRefresh && frameCache[frame.id] && frameCache[frame.id].hash === hash) {
     console.log(`[cache] HIT: ${frame.name}`);
     return res.json({ analysis: frameCache[frame.id].analysis, cached: true });
   }
 
-  await anthropicLimiter.wait();
+  const textPrompt = `Frame: "${frame.name}" | File: ${frame.fileLabel} | Page: ${frame.page} | Size: ${frame.width}x${frame.height}px\n\n${prompt}`;
 
   try {
-    const body = {
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1200,
-      messages: [{
-        role: 'user',
-        content: [
-          {
-            type: 'image',
-            source: { type: 'base64', media_type: 'image/png', data: frame.imageB64 }
-          },
-          {
-            type: 'text',
-            text: `Frame: "${frame.name}" | File: ${frame.fileLabel} | Page: ${frame.page} | Size: ${frame.width}×${frame.height}px\n\n${prompt}`
-          }
-        ]
-      }]
-    };
-
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': key,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify(body)
-    });
-
-    const data = await r.json();
-    if (!r.ok) return res.status(r.status).json({ error: data.error?.message || 'API error' });
-
-    const text = data.content?.[0]?.text || '{}';
+    const rawText = await analyzeWithGemini(frame.imageB64, textPrompt, geminiKey);
     let analysis;
-    try { analysis = JSON.parse(text.replace(/```json|```/g, '').trim()); }
-    catch { analysis = { raw: text }; }
-
-    // Cache it
+    try { analysis = JSON.parse(rawText.replace(/```json|```/g, '').trim()); }
+    catch { analysis = { raw: rawText }; }
     frameCache[frame.id] = { hash, analysis, analyzedAt: new Date().toISOString() };
     await saveCache();
-
-    res.json({
-      analysis,
-      cached: false,
-      usage: data.usage
-    });
+    console.log(`[gemini] OK: ${frame.name}`);
+    res.json({ analysis, cached: false });
   } catch(e) {
+    console.error(`[gemini] ERR: ${frame.name}: ${e.message}`);
     res.status(500).json({ error: e.message });
   }
 });
 
-// Claude synthesis proxy — full style guide
 app.post('/api/synthesize', async (req, res) => {
   const { clusters, totalFrames } = req.body;
-  const key = process.env.ANTHROPIC_API_KEY || req.headers['x-anthropic-key'] || ANTHROPIC_KEY;
+  const anthropicKey = req.headers['x-anthropic-key'] || ANTHROPIC_KEY;
+  const geminiKey = req.headers['x-gemini-key'] || GEMINI_KEY;
+  if (!anthropicKey && !geminiKey) return res.status(400).json({ error: 'No API key for synthesis' });
 
-  if (!key) return res.status(400).json({ error: 'No Anthropic API key' });
-
-  // Build cluster summaries
-  const clusterSummaries = clusters.map(cluster => {
-    const sampleAnalyses = cluster.frames.slice(0, 15).map(f =>
-      `  - ${f.frameName}: ${JSON.stringify(f.analysis)}`
-    ).join('\n');
-    return `## Cluster: ${cluster.label} (${cluster.frames.length} frames)\n${sampleAnalyses}`;
+  const clusterSummaries = clusters.map(cl => {
+    const samples = cl.frames.slice(0, 15).map(f => `  - ${f.frameName}: ${JSON.stringify(f.analysis)}`).join('\n');
+    return `## Cluster: ${cl.label} (${cl.frames.length} frames)\n${samples}`;
   }).join('\n\n');
 
-  const prompt = `You are a senior design systems architect. You've analyzed ${totalFrames} design frames from a company's Figma files, grouped into clusters by frame type.
-
-${clusterSummaries}
-
-Synthesize a comprehensive Visual Language Guide with these sections:
-
-# 1. Core Color System
-Exact hex values for primary, secondary, accent, neutral, and semantic colors. Note any dark/light mode patterns.
-
-# 2. Typography System
-Font families, heading scale (h1–h6 sizes/weights), body text rules, caption styles. Note any font pairing logic.
-
-# 3. Spacing & Layout
-Grid system, spacing scale (4px? 8px base?), common padding values, max-width patterns, responsive breakpoints if evident.
-
-# 4. Component Language
-How the team styles: buttons (sizes, variants, border-radius), cards (shadow, border, padding), inputs, navigation, badges/chips, modals. Be specific.
-
-# 5. Visual Personality
-3–5 adjectives that describe the brand. What it feels like. What it definitely does NOT do.
-
-# 6. Cluster-Specific Rules
-For each cluster type (ads, layouts, components, mobile), what are the specific design rules?
-
-# 7. The 10 Design Rules
-Numbered list of implicit rules consistently followed across all frames. These should be opinionated and specific — not generic best practices.
-
-# 8. New Component Checklist
-When building anything new, a designer should verify these things to ensure it feels native.
-
-Write in clear, specific markdown. Avoid vague language. This document will be injected into an AI design tool as ground truth.`;
+  const prompt = `You are a senior design systems architect. You have analyzed ${totalFrames} design frames from a company's Figma files grouped into clusters.\n\n${clusterSummaries}\n\nSynthesize a comprehensive Visual Language Guide:\n\n# 1. Core Color System\nExact hex values for primary, secondary, accent, neutral, semantic colors.\n\n# 2. Typography System\nFont families, heading scale, body text rules, caption styles.\n\n# 3. Spacing & Layout\nGrid system, spacing scale, common padding, max-width, breakpoints.\n\n# 4. Component Language\nButtons, cards, inputs, navigation, badges, modals — be specific.\n\n# 5. Visual Personality\n3-5 adjectives. What it feels like. What it never does.\n\n# 6. Cluster-Specific Rules\nSpecific rules per cluster type.\n\n# 7. The 10 Design Rules\nOpinionated, specific rules consistently followed across frames.\n\n# 8. New Component Checklist\nVerify these before shipping anything new.\n\nWrite in clear specific markdown. This is injected into an AI design tool as ground truth.`;
 
   try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': key,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 6000,
-        messages: [{ role: 'user', content: prompt }]
-      })
-    });
-
-    const data = await r.json();
-    if (!r.ok) return res.status(r.status).json({ error: data.error?.message });
-
-    res.json({ styleGuide: data.content?.[0]?.text || '', usage: data.usage });
+    let styleGuide = '';
+    if (anthropicKey) {
+      console.log('[synthesis] Using Anthropic');
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 6000, messages: [{ role: 'user', content: prompt }] })
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error?.message);
+      styleGuide = data.content?.[0]?.text || '';
+    } else {
+      console.log('[synthesis] Using Gemini fallback');
+      styleGuide = await synthesizeWithGemini(prompt, geminiKey);
+    }
+    res.json({ styleGuide, provider: anthropicKey ? 'anthropic' : 'gemini' });
   } catch(e) {
+    console.error('[synthesis] Error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
-// Supabase push
 app.post('/api/push-supabase', async (req, res) => {
   const { analyses, styleGuide } = req.body;
-  if (!SUPABASE_URL || !SUPABASE_KEY) {
-    return res.status(400).json({ error: 'Supabase not configured' });
-  }
-
+  if (!SUPABASE_URL || !SUPABASE_KEY) return res.status(400).json({ error: 'Supabase not configured' });
   let pushed = 0, errors = 0;
-
   for (const a of analyses) {
     try {
       const r = await fetch(`${SUPABASE_URL}/rest/v1/design_analyses`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'apikey': SUPABASE_KEY,
-          'Authorization': `Bearer ${SUPABASE_KEY}`,
-          'Prefer': 'resolution=merge-duplicates'
-        },
-        body: JSON.stringify({
-          frame_id: a.frameId,
-          frame_name: a.frameName,
-          file_label: a.fileLabel,
-          page_name: a.page,
-          cluster: a.cluster,
-          analysis: a.analysis,
-          analyzed_at: new Date().toISOString()
-        })
+        headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Prefer': 'resolution=merge-duplicates' },
+        body: JSON.stringify({ frame_id: a.frameId, frame_name: a.frameName, file_label: a.fileLabel, page_name: a.page, cluster: a.cluster, analysis: a.analysis, analyzed_at: new Date().toISOString() })
       });
       if (r.ok) pushed++; else errors++;
     } catch { errors++; }
   }
-
-  // Push style guide
   if (styleGuide) {
     await fetch(`${SUPABASE_URL}/rest/v1/style_guides`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'apikey': SUPABASE_KEY,
-        'Authorization': `Bearer ${SUPABASE_KEY}`,
-        'Prefer': 'resolution=merge-duplicates'
-      },
+      headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Prefer': 'resolution=merge-duplicates' },
       body: JSON.stringify({ content: styleGuide, generated_at: new Date().toISOString() })
     });
   }
-
   res.json({ pushed, errors });
 });
 
-// Cache stats
 app.get('/api/cache-stats', (req, res) => {
-  res.json({
-    total: Object.keys(frameCache).length,
-    entries: Object.entries(frameCache).map(([id, v]) => ({
-      id, analyzedAt: v.analyzedAt
-    }))
-  });
+  res.json({ total: Object.keys(frameCache).length, entries: Object.entries(frameCache).map(([id, v]) => ({ id, analyzedAt: v.analyzedAt })) });
 });
 
 app.delete('/api/cache', async (req, res) => {
@@ -308,15 +234,11 @@ app.delete('/api/cache', async (req, res) => {
   res.json({ ok: true });
 });
 
-// ── Start ─────────────────────────────────────────────────
 await loadCache();
-app.listen(PORT, () => {
-  console.log(`\n┌─────────────────────────────────────────┐`);
-  console.log(`│  Figma Style Learner — Proxy Server      │`);
-  console.log(`│  http://localhost:${PORT}                  │`);
-  console.log(`│                                          │`);
-  console.log(`│  Anthropic Key: ${ANTHROPIC_KEY ? '✓ configured' : '✗ missing (set ANTHROPIC_API_KEY)'}   │`);
-  console.log(`│  Figma Token:   ${FIGMA_TOKEN ? '✓ configured' : '○ optional (can use UI)'}   │`);
-  console.log(`│  Supabase:      ${(SUPABASE_URL && SUPABASE_KEY) ? '✓ configured' : '○ optional'}              │`);
-  console.log(`└─────────────────────────────────────────┘\n`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`\n Figma Style Learner Proxy running on port ${PORT}`);
+  console.log(` Vision:    ${GEMINI_KEY    ? 'Gemini OK'        : 'GEMINI_API_KEY missing'}`);
+  console.log(` Synthesis: ${ANTHROPIC_KEY ? 'Anthropic OK'     : 'Gemini fallback'}`);
+  console.log(` Figma:     ${FIGMA_TOKEN   ? 'Token configured' : 'set via UI'}`);
+  console.log(` Supabase:  ${(SUPABASE_URL && SUPABASE_KEY) ? 'configured' : 'not configured'}\n`);
 });
